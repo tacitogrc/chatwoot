@@ -1,0 +1,18 @@
+# Override to avoid port conflicts with other running containers.
+# postgres and redis host ports are remapped since 5432 and 6379 are already in use.
+# Also includes Windows-specific adjustments (from docker-compose.windows.override.yaml).
+
+services:
+  postgres:
+    ports:
+      - '5433:5432'
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+
+  redis:
+    ports:
+      - '6380:6379'
+
+  vite:
+    entrypoint: ["/bin/sh", "-lc"]
+    command: "node_modules/.bin/vite dev --host 0.0.0.0 --port 3036"
