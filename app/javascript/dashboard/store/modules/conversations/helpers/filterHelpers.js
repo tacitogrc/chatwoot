@@ -46,8 +46,8 @@
  * 2. Nested properties in additional_attributes (browser_language, referer, etc.)
  * 3. Nested properties in custom_attributes (conversation_type, etc.)
  */
-import jsonLogic from 'json-logic-js';
 import { coerceToDate } from '@chatwoot/utils';
+import jsonLogic from 'json-logic-js';
 
 /**
  * Gets a value from a conversation based on the attribute key
@@ -73,6 +73,12 @@ const getValueFromConversation = (conversation, attributeKey) => {
       return conversation.display_id || conversation.id;
     case 'assignee_id':
       return conversation.meta?.assignee?.id;
+    case 'contact_id':
+      return (
+        conversation.meta?.sender?.id ||
+        conversation.contact?.id ||
+        conversation.contact_id
+      );
     case 'inbox_id':
       return conversation.inbox_id;
     case 'team_id':
@@ -121,7 +127,8 @@ const resolveValue = candidate => {
  * @returns {Boolean} - Returns true if the values are considered equal according to filtering rules
  *
  * This function handles various equality scenarios:
- * 1. When both values are arrays: checks if all items in filterValue exist in conversationValue
+ * 1. When both values are arrays (e.g. labels): matches if any filter value exists in the conversation array
+ *    (mirrors the backend SQL `tag_id IN (...)` OR semantics)
  * 2. When filterValue is an array but conversationValue is not: checks if conversationValue is included in filterValue
  * 3. Otherwise: performs strict equality comparison
  */
@@ -131,8 +138,9 @@ const equalTo = (filterValue, conversationValue) => {
     if (filterValue === 'all') return true;
 
     if (Array.isArray(conversationValue)) {
-      // For array values like labels, check if any of the filter values exist in the array
-      return filterValue.every(val => conversationValue.includes(val));
+      // For array values like labels, match if any filter value is present.
+      // Mirrors the backend SQL `tag_id IN (...)` (OR semantics).
+      return filterValue.some(val => conversationValue.includes(val));
     }
 
     if (!Array.isArray(conversationValue)) {
@@ -162,6 +170,46 @@ const contains = (filterValue, conversationValue) => {
   return false;
 };
 
+const DATE_ONLY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Checks whether a value is a calendar date without a time, as emitted by the
+ * date pickers and required by the backend (Date.iso8601)
+ * @param {*} value - The value to check
+ * @returns {Boolean} - Returns true for `YYYY-MM-DD` strings
+ */
+const isDateOnly = value =>
+  typeof value === 'string' && DATE_ONLY_PATTERN.test(value);
+
+/**
+ * Reduces a value to its calendar day in the filter timezone
+ * @param {*} value - An epoch timestamp, an ISO string or a `YYYY-MM-DD` string
+ * @returns {Number|null} - Milliseconds at UTC midnight, or null when unparseable
+ *
+ * `coerceToDate` reads a `YYYY-MM-DD` string as midnight in the browser
+ * timezone, which lands on the previous day for browsers behind UTC.
+ */
+const toCalendarDay = (value, timezone = 'UTC') => {
+  const date = isDateOnly(value)
+    ? new Date(`${value}T00:00:00.000Z`)
+    : coerceToDate(value);
+
+  if (date === null) return null;
+
+  if (isDateOnly(value)) return date.getTime();
+
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+  }).formatToParts(date);
+  const { year, month, day } = Object.fromEntries(
+    parts.map(part => [part.type, part.value])
+  );
+  return Date.UTC(Number(year), Number(month) - 1, Number(day));
+};
+
 /**
  * Compares two date values using a comparison function
  * @param {*} conversationValue - The conversation value to compare
@@ -169,14 +217,24 @@ const contains = (filterValue, conversationValue) => {
  * @param {Function} compareFn - The comparison function to apply
  * @returns {Boolean} - Returns true if the comparison succeeds, false otherwise
  */
-const compareDates = (conversationValue, filterValue, compareFn) => {
-  const conversationDate = coerceToDate(conversationValue);
-
+const compareDates = (conversationValue, filterValue, compareFn, timezone) => {
   // In saved views, the filterValue might be returned as an Array
   // In conversation list, when filtering, the filterValue will be returned as a string
   const valueToCompare = Array.isArray(filterValue)
     ? filterValue[0]
     : filterValue;
+
+  // Match the backend's calendar-day comparison in the saved timezone.
+  // Date-only custom attributes keep their literal calendar date.
+  if (isDateOnly(valueToCompare)) {
+    const conversationDay = toCalendarDay(conversationValue, timezone);
+    const filterDay = toCalendarDay(valueToCompare);
+
+    if (conversationDay === null || filterDay === null) return false;
+    return compareFn(conversationDay, filterDay);
+  }
+
+  const conversationDate = coerceToDate(conversationValue);
   const filterDate = coerceToDate(valueToCompare);
 
   if (conversationDate === null || filterDate === null) return false;
@@ -194,6 +252,11 @@ const matchesCondition = (conversationValue, filter) => {
 
   const isNullish =
     conversationValue === null || conversationValue === undefined;
+  const isEmptyLabels =
+    filter.attribute_key === 'labels' &&
+    Array.isArray(conversationValue) &&
+    conversationValue.length === 0;
+  const isAbsent = isNullish || isEmptyLabels;
 
   const filterValue = Array.isArray(values)
     ? values.map(resolveValue)
@@ -213,20 +276,39 @@ const matchesCondition = (conversationValue, filter) => {
       return !contains(filterValue, conversationValue);
 
     case 'is_present':
-      return !isNullish;
+      return !isAbsent;
 
     case 'is_not_present':
-      return isNullish;
+      return isAbsent;
 
     case 'is_greater_than':
-      return compareDates(conversationValue, filterValue, (a, b) => a > b);
+      return compareDates(
+        conversationValue,
+        filterValue,
+        (a, b) => a > b,
+        filter.timezone
+      );
 
     case 'is_less_than':
-      return compareDates(conversationValue, filterValue, (a, b) => a < b);
+      return compareDates(
+        conversationValue,
+        filterValue,
+        (a, b) => a < b,
+        filter.timezone
+      );
 
     case 'days_before': {
       if (isNullish) {
         return false;
+      }
+
+      if (filter.timezone) {
+        const targetDay = new Date(toCalendarDay(Date.now(), filter.timezone));
+        targetDay.setUTCDate(targetDay.getUTCDate() - Number(filterValue));
+        return (
+          toCalendarDay(conversationValue, filter.timezone) <
+          targetDay.getTime()
+        );
       }
 
       const today = new Date();
@@ -238,6 +320,24 @@ const matchesCondition = (conversationValue, filter) => {
     default:
       return false;
   }
+};
+
+const matchesConversationCondition = (conversation, filter) => {
+  const isHumanAssigneeFilter =
+    filter.attribute_key === 'assignee_id' &&
+    ['equal_to', 'not_equal_to'].includes(filter.filter_operator);
+  const isAiAssignee =
+    conversation.meta?.assignee_type &&
+    conversation.meta.assignee_type !== 'User';
+
+  if (isHumanAssigneeFilter && isAiAssignee) {
+    return false;
+  }
+
+  return matchesCondition(
+    getValueFromConversation(conversation, filter.attribute_key),
+    filter
+  );
 };
 
 /**
@@ -343,8 +443,7 @@ const buildJsonLogicRule = evaluatedFilters => {
  */
 const evaluateFilters = (conversation, filters) => {
   return filters.map((filter, index) => {
-    const value = getValueFromConversation(conversation, filter.attribute_key);
-    const result = matchesCondition(value, filter);
+    const result = matchesConversationCondition(conversation, filter);
 
     // This part determines the logical operator that connects this filter to the next one:
     // - If this is not the last filter (index < filters.length - 1), use the filter's query_operator
@@ -371,12 +470,7 @@ export const matchesFilters = (conversation, filters) => {
 
   // Handle single filter case
   if (filters.length === 1) {
-    const value = getValueFromConversation(
-      conversation,
-      filters[0].attribute_key
-    );
-
-    return matchesCondition(value, filters[0]);
+    return matchesConversationCondition(conversation, filters[0]);
   }
 
   // Evaluate all conditions and prepare for jsonLogic
